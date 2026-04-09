@@ -1,20 +1,43 @@
 package com.app.pricing;
 
 import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.pricing.PricingClient;
+import software.amazon.awssdk.services.pricing.model.*;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.*;
 import java.time.LocalDateTime;
 
 /**
- * Dynamic AWS Pricing Service that fetches real pricing from AWS
- * In production, integrate with AWS Pricing API
- * For now, provides caching and regional pricing support
+ * AWS Pricing Service - Fetches REAL pricing from AWS Pricing API
+ * NO FALLBACK - Uses real AWS pricing only
  */
 @Service
 public class AWSPricingService {
     
+    private final PricingClient pricingClient;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    
     private Map<String, RegionalPricing> priceCache = new HashMap<>();
     private LocalDateTime lastUpdated = LocalDateTime.now();
     private static final long CACHE_DURATION_HOURS = 24;
+    
+    public AWSPricingService() {
+        try {
+            this.pricingClient = PricingClient.builder().region(
+                software.amazon.awssdk.regions.Region.US_EAST_1
+            ).build();
+            System.out.println("✓ AWS Pricing Client initialized - REAL AWS PRICING ENABLED (NO FALLBACK)");
+        } catch (Exception e) {
+            throw new RuntimeException(
+                "CRITICAL: Failed to initialize AWS Pricing Client.\n" +
+                "Set AWS credentials:\n" +
+                "export AWS_ACCESS_KEY_ID=\"your-key\"\n" +
+                "export AWS_SECRET_ACCESS_KEY=\"your-secret\"\n" +
+                "NO FALLBACK MODE - Application requires real AWS credentials", e
+            );
+        }
+    }
     
     public static class PricingQuery {
         public String service; // "EC2", "RDS", "S3", etc.
@@ -52,6 +75,10 @@ public class AWSPricingService {
         }
     }
     
+    private String generateCacheKey(PricingQuery query) {
+        return String.format("%s_%s_%s", query.service, query.resourceType, query.region);
+    }
+    
     /**
      * Get pricing for an AWS resource
      * In production, this would call AWS Pricing API
@@ -86,106 +113,120 @@ public class AWSPricingService {
     }
     
     /**
-     * Fetch price from AWS Pricing API
-     * TODO: Integrate with actual AWS Pricing API
+     * Fetch real pricing from AWS Pricing API - NO FALLBACK
      */
     private RegionalPricing fetchPriceFromAWS(PricingQuery query) {
-        // In production, call AWS Pricing API
-        // For now, use hardcoded fallback with regional adjustments
-        
-        double basePrice = getBasePriceFromFallback(query);
-        double regionalMultiplier = getRegionalMultiplier(query.region);
-        double finalHourlyPrice = basePrice * regionalMultiplier;
-        
-        return new RegionalPricing(query.service, query.resourceType, query.region, finalHourlyPrice);
+        try {
+            String serviceCode = getServiceCode(query.service);
+            String regionName = getRegionName(query.region);
+            
+            List<Filter> filters = new ArrayList<>();
+            filters.add(Filter.builder()
+                .type(FilterType.TERM_MATCH)
+                .field("location")
+                .value(regionName)
+                .build());
+            
+            if ("EC2".equalsIgnoreCase(query.service)) {
+                filters.add(Filter.builder()
+                    .type(FilterType.TERM_MATCH)
+                    .field("operatingSystem")
+                    .value("Linux")
+                    .build());
+                
+                filters.add(Filter.builder()
+                    .type(FilterType.TERM_MATCH)
+                    .field("instanceType")
+                    .value(query.resourceType)
+                    .build());
+            } else if ("RDS".equalsIgnoreCase(query.service)) {
+                filters.add(Filter.builder()
+                    .type(FilterType.TERM_MATCH)
+                    .field("instanceType")
+                    .value(query.resourceType)
+                    .build());
+            }
+            
+            GetProductsRequest request = GetProductsRequest.builder()
+                .serviceCode(serviceCode)
+                .filters(filters)
+                .maxResults(1)
+                .build();
+            
+            GetProductsResponse response = pricingClient.getProducts(request);
+            
+            if (response.priceList().isEmpty()) {
+                throw new RuntimeException(
+                    "NO PRICING FOUND: " + query.service + " " + query.resourceType + 
+                    " in " + query.region
+                );
+            }
+            
+            String priceJson = response.priceList().get(0);
+            double hourlyPrice = parsePrice(priceJson);
+            
+            System.out.println("✓ Real AWS: $" + String.format("%.6f", hourlyPrice) + "/hr ($" + 
+                String.format("%.2f", hourlyPrice * 730) + "/mo)");
+            
+            return new RegionalPricing(query.service, query.resourceType, query.region, hourlyPrice);
+            
+        } catch (Exception e) {
+            String error = "\n❌ FATAL: Real AWS Pricing API failed (NO FALLBACK)\n" +
+                "Service: " + query.service + "\n" +
+                "Resource: " + query.resourceType + "\n" +
+                "Error: " + e.getMessage();
+            System.err.println(error);
+            throw new RuntimeException(error, e);
+        }
     }
+    
     
     /**
-     * Hardcoded fallback pricing (as in original PricingConfig)
+     * Parse price from AWS Pricing API JSON response
      */
-    private double getBasePriceFromFallback(PricingQuery query) {
-        if ("EC2".equalsIgnoreCase(query.service)) {
-            return getEC2Price(query.resourceType);
-        }
-        if ("RDS".equalsIgnoreCase(query.service)) {
-            return getRDSPrice(query.resourceType);
-        }
-        if ("S3".equalsIgnoreCase(query.service)) {
-            return getS3Price(query.resourceType);
-        }
-        if ("Lambda".equalsIgnoreCase(query.service)) {
-            return 0.0000002; // Per millisecond
-        }
-        if ("ALB".equalsIgnoreCase(query.service) || "ELB".equalsIgnoreCase(query.service)) {
-            return getLoadBalancerPrice(query.resourceType);
-        }
-        return 0.0;
-    }
-    
-    /**
-     * Regional price multiplier (1.0 = us-east-1)
-     */
-    private double getRegionalMultiplier(String region) {
-        Map<String, Double> multipliers = new HashMap<>();
-        multipliers.put("us-east-1", 1.0);
-        multipliers.put("us-east-2", 0.95);
-        multipliers.put("us-west-1", 1.1);
-        multipliers.put("us-west-2", 0.95);
-        multipliers.put("eu-west-1", 1.15);
-        multipliers.put("eu-central-1", 1.2);
-        multipliers.put("ap-southeast-1", 1.15);
-        multipliers.put("ap-northeast-1", 1.25);
-        multipliers.put("ap-south-1", 0.9);
+    private double parsePrice(String priceJson) throws Exception {
+        JsonNode root = objectMapper.readTree(priceJson);
+        JsonNode termsNode = root.path("terms");
+        JsonNode onDemandNode = termsNode.path("OnDemand");
+        JsonNode skuNode = onDemandNode.elements().next();
+        JsonNode priceDimensionsNode = skuNode.path("priceDimensions");
+        JsonNode priceNode = priceDimensionsNode.elements().next()
+            .path("pricePerUnit")
+            .path("USD");
         
-        return multipliers.getOrDefault(region, 1.0);
+        return Double.parseDouble(priceNode.asText());
     }
     
-    private double getEC2Price(String instanceType) {
-        Map<String, Double> pricing = new HashMap<>();
-        pricing.put("t3.micro", 0.0104);
-        pricing.put("t3.small", 0.0208);
-        pricing.put("t3.medium", 0.0416);
-        pricing.put("t3.large", 0.0832);
-        pricing.put("t3.xlarge", 0.1664);
-        pricing.put("t3.2xlarge", 0.3328);
-        pricing.put("m5.large", 0.096);
-        pricing.put("m5.xlarge", 0.192);
-        pricing.put("m5.2xlarge", 0.384);
-        pricing.put("c5.large", 0.085);
-        pricing.put("c5.xlarge", 0.17);
-        pricing.put("c5.2xlarge", 0.34);
-        return pricing.getOrDefault(instanceType.toLowerCase(), 0.05);
+    private String getServiceCode(String service) {
+        switch(service.toUpperCase()) {
+            case "EC2": return "AmazonEC2";
+            case "RDS": return "AmazonRDS";
+            case "S3": return "AmazonS3";
+            case "LAMBDA": return "AWSLambda";
+            case "ALB":
+            case "ELB": return "ElasticLoadBalancing";
+            default: throw new RuntimeException("Unsupported service: " + service);
+        }
     }
     
-    private double getRDSPrice(String instanceClass) {
-        Map<String, Double> pricing = new HashMap<>();
-        pricing.put("db.t3.micro", 0.017);
-        pricing.put("db.t3.small", 0.034);
-        pricing.put("db.t3.medium", 0.068);
-        pricing.put("db.m5.large", 0.203);
-        pricing.put("db.m5.xlarge", 0.406);
-        pricing.put("db.m5.2xlarge", 0.812);
-        pricing.put("db.r5.large", 0.58);
-        pricing.put("db.r5.xlarge", 1.16);
-        return pricing.getOrDefault(instanceClass.toLowerCase(), 0.1);
-    }
-    
-    private double getS3Price(String tier) {
-        // Price per GB per month
-        Map<String, Double> pricing = new HashMap<>();
-        pricing.put("standard", 0.023);
-        pricing.put("infrequent_access", 0.0125);
-        pricing.put("glacier", 0.004);
-        return pricing.getOrDefault(tier.toLowerCase(), 0.023);
-    }
-    
-    private double getLoadBalancerPrice(String type) {
-        // Price per hour
-        return "nlb".equalsIgnoreCase(type) ? 0.0351 : 0.0252; // ALB default
-    }
-    
-    private String generateCacheKey(PricingQuery query) {
-        return String.format("%s_%s_%s", query.service, query.resourceType, query.region);
+    private String getRegionName(String region) {
+        Map<String, String> regionMap = new HashMap<>();
+        regionMap.put("us-east-1", "US East (N. Virginia)");
+        regionMap.put("us-east-2", "US East (Ohio)");
+        regionMap.put("us-west-1", "US West (N. California)");
+        regionMap.put("us-west-2", "US West (Oregon)");
+        regionMap.put("eu-west-1", "EU (Ireland)");
+        regionMap.put("eu-central-1", "EU (Frankfurt)");
+        regionMap.put("eu-west-2", "EU (London)");
+        regionMap.put("ap-southeast-1", "Asia Pacific (Singapore)");
+        regionMap.put("ap-northeast-1", "Asia Pacific (Tokyo)");
+        regionMap.put("ap-south-1", "Asia Pacific (Mumbai)");
+        
+        String regionName = regionMap.get(region);
+        if (regionName == null) {
+            throw new RuntimeException("Unsupported region: " + region);
+        }
+        return regionName;
     }
     
     private boolean isCacheExpired() {
